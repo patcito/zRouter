@@ -310,6 +310,12 @@ contract ZHubComparator {
             (,, address pool, bool useUnd, bool isStab, uint8 ci, uint8 cj) =
                 QUOTER.quoteCurve(false, tokenIn, tokenOut, swapAmount, 8);
             if (pool == address(0)) return "";
+            // An underlying (meta-pool) Curve leg needs the basePools array this
+            // encoder does not populate, and such quotes have been observed
+            // inflated on-chain, which would make us return a route that reverts
+            // on execution. Skip the hub rather than emit calldata we cannot
+            // faithfully build. A plain single-pool Curve leg is still encoded.
+            if (useUnd) return "";
             return _buildCurveLeg(to, tokenIn, tokenOut, swapAmount, amountLimit, deadline, pool, useUnd, isStab, ci, cj);
         }
         if (q.source == IZQuoter.AMM.UNI_V2 || q.source == IZQuoter.AMM.SUSHI) {
