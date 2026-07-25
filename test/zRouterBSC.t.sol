@@ -35,6 +35,7 @@ contract zRouterBSCTest is Test {
     address constant CL_BTC_USD = 0x264990fbd0A4796A3E3d8E37C4d5F87a3aCa5Ebf;
 
     uint256 constant TOL_BPS = 500; // 5% tolerance vs Chainlink
+    uint256 constant ALT_VENUE = 1 << 255; // venue flag bit (matches router/quoter)
 
     address USER = makeAddr("USER");
 
@@ -109,6 +110,92 @@ contract zRouterBSCTest is Test {
         assertGt(amountOut, 0);
         assertEq(quoted, amountOut);
         console2.log("SUSHI   0.5 BNB -> USDT:", amountOut / 1e18);
+    }
+
+    function testV2_ExactIn_Sushi_PackedDeadline() public {
+        uint256 packed = ALT_VENUE | (block.timestamp + 1000);
+        (, uint256 quoted) = quoter.quoteV2(false, address(0), USDT, 0.5 ether, true);
+        vm.prank(USER);
+        (uint256 amountIn, uint256 amountOut) = router.swapV2{value: 0.5 ether}(
+            USER, false, address(0), USDT, 0.5 ether, 0, packed
+        );
+        assertEq(amountIn, 0.5 ether);
+        assertEq(amountOut, quoted); // venue = sushi, finite deadline honored
+    }
+
+    function testV2_Sushi_PackedExpired_Reverts() public {
+        uint256 packed = ALT_VENUE | (block.timestamp - 1);
+        vm.prank(USER);
+        vm.expectRevert(zRouter.Expired.selector); // packed deadlines are really enforced
+        router.swapV2{value: 0.5 ether}(USER, false, address(0), USDT, 0.5 ether, 0, packed);
+    }
+
+    function testV3_ExactIn_ETHtoUSDT_UNI_PackedDeadline() public {
+        uint256 packed = ALT_VENUE | (block.timestamp + 1000);
+        (, uint256 uniQuoted) = quoter.quoteV3(false, ETH_BSC, USDT, 1 ether, 500, true);
+        vm.prank(USER);
+        (uint256 amountIn, uint256 amountOut) =
+            router.swapV3(USER, false, 500, ETH_BSC, USDT, 1 ether, 0, packed);
+        assertEq(amountIn, 1 ether);
+        assertEq(amountOut, uniQuoted); // venue = uni v3, finite deadline honored
+    }
+
+    function testV3_UNI_PackedExpired_Reverts() public {
+        uint256 packed = ALT_VENUE | (block.timestamp - 1);
+        vm.prank(USER);
+        vm.expectRevert(zRouter.Expired.selector);
+        router.swapV3(USER, false, 500, ETH_BSC, USDT, 1 ether, 0, packed);
+    }
+
+    /// @dev deadline == ALT_VENUE decodes to 0 → instantly Expired (no flag-only call).
+    function testV2_PackedZeroDeadline_Reverts() public {
+        vm.prank(USER);
+        vm.expectRevert(zRouter.Expired.selector);
+        router.swapV2{value: 0.5 ether}(USER, false, address(0), USDT, 0.5 ether, 0, ALT_VENUE);
+    }
+
+    /// @dev deadline == ALT_VENUE - 1 has the venue bit clear → PancakeSwap, no expiry.
+    function testV2_JustBelowVenueBit_StaysPCS() public {
+        (, uint256 quoted) = quoter.quoteV2(false, address(0), USDT, 5 ether, false);
+        vm.prank(USER);
+        (, uint256 amountOut) = router.swapV2{value: 5 ether}(
+            USER, false, address(0), USDT, 5 ether, 0, ALT_VENUE - 1
+        );
+        assertEq(amountOut, quoted);
+    }
+
+    /// @dev A finite packed deadline into buildBestSwap with a PCS winner must
+    ///      round-trip: venue bit stripped, caller's timestamp preserved.
+    function testBuildBestSwap_PackedDeadline_PCS_RoundTrips() public {
+        uint256 ts = block.timestamp + 300;
+        (bytes memory cd, zQuoter.Quote memory best) =
+            quoter.buildBestSwap(USER, false, address(0), USDT, 1 ether, 0, ALT_VENUE | ts);
+        assertTrue(best.source != zQuoter.AMM.CURVE);
+        bytes memory args = new bytes(cd.length - 4);
+        for (uint256 i; i < args.length; ++i) {
+            args[i] = cd[i + 4];
+        }
+        uint256 encodedDeadline;
+        if (best.source == zQuoter.AMM.PCS_V2 || best.source == zQuoter.AMM.SUSHI) {
+            (,,,,,, encodedDeadline) =
+                abi.decode(args, (address, bool, address, address, uint256, uint256, uint256));
+        } else {
+            (,,,,,,, encodedDeadline) = abi.decode(
+                args, (address, bool, uint24, address, address, uint256, uint256, uint256)
+            );
+        }
+        bool isPcs = best.source == zQuoter.AMM.PCS_V2 || best.source == zQuoter.AMM.PCS_V3;
+        if (isPcs) {
+            assertEq(encodedDeadline, ts, "PCS winner must keep the caller's finite deadline");
+        } else {
+            assertEq(encodedDeadline, ts | ALT_VENUE, "alt venue must repack the deadline");
+        }
+        // and it must execute:
+        uint256 balBefore = IERC20(USDT).balanceOf(USER);
+        vm.prank(USER);
+        (bool ok,) = address(router).call{value: 1 ether}(cd);
+        assertTrue(ok, "built swap failed");
+        assertEq(IERC20(USDT).balanceOf(USER) - balBefore, best.amountOut);
     }
 
     function testV3_ExactIn_ETHtoUSDT_PCS() public {
@@ -255,7 +342,15 @@ contract zRouterBSCTest is Test {
                 args, (address, bool, uint24, address, address, uint256, uint256, uint256)
             );
         }
-        assertNotEq(encodedDeadline, type(uint256).max, "PCS winner must not inherit max deadline");
+        bool isPcs = best.source == zQuoter.AMM.PCS_V2 || best.source == zQuoter.AMM.PCS_V3;
+        if (isPcs) {
+            assertNotEq(
+                encodedDeadline, type(uint256).max, "PCS winner must not inherit max deadline"
+            );
+        } else {
+            // alt venues legitimately encode max (legacy no-expiry form of the venue bit)
+            assertEq(encodedDeadline, type(uint256).max);
+        }
         // and the built swap must execute on the quoted venue:
         uint256 balBefore = IERC20(USDT).balanceOf(USER);
         vm.prank(USER);
@@ -265,19 +360,30 @@ contract zRouterBSCTest is Test {
     }
 
     /// @dev V3 pools stop at the price limit instead of reverting on exact-out
-    ///      under-delivery — the router must now revert Slippage instead of shorting the user.
+    ///      under-delivery — the router must never silently succeed with a short fill.
     function testV3_ExactOut_UnderdeliverReverts() public {
+        // the 2500-tier pool holds only ~3.4 ETH, so a 10 ETH exact-out cannot fill.
+        // Two protection layers can fire: the new Slippage shortfall check when the
+        // partial input is affordable, or TransferFromFailed when the price walk to
+        // the limit makes it unaffordable (the usual live-pool case). Success with a
+        // short fill — the pre-fix behavior — must not happen:
+        bytes memory cd = abi.encodeCall(
+            zRouter.swapV3, (USER, true, 2500, USDT, ETH_BSC, 10 ether, 0, block.timestamp + 1000)
+        );
         vm.prank(USER);
-        vm.expectRevert(); // Slippage
-        router.swapV3(
-            USER, true, 500, USDT, ETH_BSC, 1_000_000 ether, 0, block.timestamp + 1000
+        (bool ok, bytes memory rd) = address(router).call(cd);
+        assertTrue(!ok, "oversized exact-out must revert");
+        bytes4 sel = rd.length >= 4 ? bytes4(rd) : bytes4(0);
+        assertTrue(
+            sel == zRouter.Slippage.selector || sel == bytes4(0x7939f424), // TransferFromFailed
+            "unexpected revert reason"
         );
     }
 
     /// @dev V2 exact-out with amountOut >= reserves must revert BadSwap, not wrap/div-by-zero.
     function testV2_ExactOut_BeyondReservesReverts() public {
         vm.prank(USER);
-        vm.expectRevert(); // BadSwap
+        vm.expectRevert(zRouter.BadSwap.selector);
         router.swapV2{value: 1 ether}(
             USER, true, address(0), USDT, type(uint112).max, 0, block.timestamp + 1000
         );
@@ -290,7 +396,7 @@ contract zRouterBSCTest is Test {
         bytes memory cd = abi.encodePacked(
             bytes4(0xfa461e33), int256(1), int256(-1), evilData // uniswapV3SwapCallback shape
         );
-        vm.expectRevert(); // Unauthorized (no in-flight swap bound)
+        vm.expectRevert(zRouter.Unauthorized.selector); // no in-flight swap bound
         address(router).call(cd);
     }
 

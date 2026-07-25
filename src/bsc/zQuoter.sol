@@ -74,12 +74,15 @@ contract zQuoter {
         uint256 deadline
     ) public returns (bytes memory callData, Quote memory best) {
         best = _pickBest(getQuotes(exactOut, tokenIn, tokenOut, swapAmount), exactOut, true);
-        // A PancakeSwap winner must never receive deadline == type(uint256).max: the
-        // router reads that as the SushiSwap/Uniswap V3 sentinel and would silently
-        // swap on the wrong venue. Clamp it to the same 30-minute default:
-        if (deadline == type(uint256).max) {
+        // A PancakeSwap winner must never receive a deadline with the venue bit set:
+        // the router reads bit 255 as the SushiSwap/Uniswap V3 flag and would silently
+        // swap on the wrong venue. Legacy max carries no real deadline — clamp it to a
+        // 30-minute default; a packed finite deadline keeps its lower 255 bits:
+        if (deadline >= ALT_VENUE) {
             if (best.source == AMM.PCS_V2 || best.source == AMM.PCS_V3) {
-                deadline = block.timestamp + 30 minutes;
+                deadline = deadline == type(uint256).max
+                    ? block.timestamp + 30 minutes
+                    : deadline & ~ALT_VENUE;
             }
         }
         if (best.source == AMM.PCS_V2 || best.source == AMM.SUSHI) {
@@ -92,7 +95,8 @@ contract zQuoter {
                     tokenOut,
                     swapAmount,
                     amountLimit,
-                    best.source == AMM.SUSHI ? type(uint256).max : deadline
+                    // alt venues keep the caller's deadline under the venue bit:
+                    best.source == AMM.SUSHI ? deadline | ALT_VENUE : deadline
                 )
             );
         } else {
@@ -107,7 +111,7 @@ contract zQuoter {
                     tokenOut,
                     swapAmount,
                     amountLimit,
-                    best.source == AMM.UNI_V3 ? type(uint256).max : deadline
+                    best.source == AMM.UNI_V3 ? deadline | ALT_VENUE : deadline
                 )
             );
         }
@@ -429,6 +433,9 @@ interface IQuoterV2 {
 }
 
 // BSC constants:
+
+/// @dev Bit 255 of `deadline` flags the alternate venue in the router (see zRouter).
+uint256 constant ALT_VENUE = 1 << 255;
 
 address constant WBNB = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
 address constant CURVE_ETH = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;

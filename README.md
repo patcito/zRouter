@@ -36,23 +36,29 @@ Onchain dapp deployment: [base.zamm.eth](https://base.zamm.eth.limo)
 
 ## BSC deployment
 
-Supports PancakeSwap V2 (0.25% fee) in `swapV2()`, SushiSwap via the `type(uint256).max`
-deadline sentinel, PancakeSwap V3 (fee tiers 100/500/2500/10000) in `swapV3()`, Uniswap V3
-(fee tiers 100/500/3000/10000) via the same deadline sentinel, Uniswap V4 in `swapV4()`,
-and calldata-routed Curve pools in `swapCurve()`. Native BNB is abstracted like ETH (`WBNB`).
+Supports PancakeSwap V2 (0.25% fee) in `swapV2()`, SushiSwap, PancakeSwap V3 (fee tiers
+100/500/2500/10000) in `swapV3()`, Uniswap V3 (fee tiers 100/500/3000/10000), Uniswap V4
+in `swapV4()`, and calldata-routed Curve pools in `swapCurve()`. Native BNB is abstracted
+like ETH (`WBNB`).
+
+Venue selection uses a **bit-packed deadline**: setting bit 255 of the `deadline`
+argument (`deadline | (1 << 255)`) selects the alternate venue — SushiSwap in `swapV2()`,
+Uniswap V3 in `swapV3()` — while the lower 255 bits remain a real, enforced deadline. The
+lower bits must carry a real future timestamp: `1 << 255` alone decodes to deadline 0 and
+reverts `Expired`. Legacy `type(uint256).max` (all bits set) still selects the alternate
+venue with effectively no expiry. The bit has no meaning in `swapV4()`/`swapCurve()` —
+pass plain timestamps there.
 
 The BSC quoter (`src/bsc/zQuoter.sol`) quotes all of the above via `getQuotes()` /
-`bestQuote()` and builds winning V2/V3 swaps with `buildBestSwap()`. Note it is non-view
-(like Uniswap's QuoterV2) — call it offchain with `eth_call`. Curve BSC liquidity is
-mostly gone, so Curve quotes usually return zero; the mechanism still works for live pools.
+`bestQuote()` and builds winning V2/V3 swaps with `buildBestSwap()` (it packs the venue
+bit for SushiSwap/Uniswap winners and clamps it for PancakeSwap winners). Note it is
+non-view (like Uniswap's QuoterV2) — call it offchain with `eth_call`. Curve BSC
+liquidity is mostly gone, so Curve quotes usually return zero; the mechanism still works
+for live pools.
 
-Known limitations (shared with the other chain routers):
-- The `deadline == type(uint256).max` venue sentinel carries no effective expiry — the
-  reassigned 30-minute default is never re-checked. Consequently `buildBestSwap()` cannot
-  express a finite deadline when a SushiSwap/Uniswap V3 quote wins.
-- Curve exact-output quotes (`get_dx + 1`) can underestimate the required input by a
-  few wei, in which case the swap reverts at the final slippage check. Prefer exact-in
-  for Curve routes.
+Known limitation (shared with the other chain routers): Curve exact-output quotes
+(`get_dx + 1`) can underestimate the required input by a few wei, in which case the swap
+reverts at the final slippage check. Prefer exact-in for Curve routes.
 
 BSC fork tests: `forge test --match-contract zRouterBSCTest` (requires a BSC RPC URL in the
 `BSC_RPC_URL` env var — `foundry.toml` reads `bsc = "${BSC_RPC_URL}"`; do not commit keys).
@@ -65,7 +71,7 @@ Ensure atomic token allowances for best security. Previous versions may not have
 
 - If using hookless zamm (0x00...888), set `deadline` to `type(uint256).max` to trigger in `swapVZ()`
 - If using SushiSwap (classic), set `deadline` to `type(uint256).max` to trigger in `swapV2()`
-- On BSC, the same sentinel selects Uniswap V3 over PancakeSwap V3 in `swapV3()`
+- On BSC, `deadline`'s bit 255 is the alternate-venue flag (SushiSwap in `swapV2()`, Uniswap V3 in `swapV3()`) and the lower 255 bits stay a real deadline — see "BSC deployment"
 
 Both case default deadline to `(now) + 30 minutes`, which is a reasonable staleness guard.
 

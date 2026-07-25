@@ -173,6 +173,12 @@ contract ZHubComparator {
     /// @notice Best exact-in route for tokenIn -> tokenOut across the direct route
     ///         and every hub two-leg route, as executable calldata for zRouter.
     /// @param to           recipient of the output.
+    /// @param refundTo      recipient of leg 1's leftover intermediate. Keep this
+    ///                      OFF the output recipient when that recipient is a
+    ///                      contract that accounts strictly for `tokenOut`: the
+    ///                      sweep delivers the INTERMEDIATE token, which such a
+    ///                      contract never asked for. Pass the executing address
+    ///                      (e.g. the filler) unless you want it with the output.
     /// @param tokenIn      ERC20 sold. Native ETH is not supported.
     /// @param tokenOut     ERC20 bought. Native ETH is not supported.
     /// @param amountIn     exact input amount.
@@ -184,12 +190,14 @@ contract ZHubComparator {
     /// @return hub         the intermediate token when viaHub, else address(0).
     function bestExactIn(
         address to,
+        address refundTo,
         address tokenIn,
         address tokenOut,
         uint256 amountIn,
         uint256 slippageBps,
         uint256 deadline
     ) external view returns (uint256 amountOut, bytes memory callData, bool viaHub, address hub) {
+        require(refundTo != address(0), "refundTo required");
         require(tokenIn != address(0) && tokenOut != address(0), "native ETH unsupported");
         require(tokenIn != tokenOut, "identical tokens");
         require(amountIn != 0, "zero amount");
@@ -218,7 +226,8 @@ contract ZHubComparator {
             address mid = hubs[i];
             if (mid == tokenIn || mid == tokenOut) continue;
 
-            (uint256 out, bytes memory cd) = _hubRoute(to, tokenIn, tokenOut, mid, amountIn, slippageBps, deadline);
+            (uint256 out, bytes memory cd) =
+                _hubRoute(to, refundTo, tokenIn, tokenOut, mid, amountIn, slippageBps, deadline);
             // Upstream's margin: a hub route must beat the incumbent by >~2%, not
             // by a wei. A two-leg route carries more revert risk than a direct
             // one, so a marginal gain is not worth switching for.
@@ -237,6 +246,7 @@ contract ZHubComparator {
     ///      either leg cannot be served, so the caller simply skips this hub.
     function _hubRoute(
         address to,
+        address refundTo,
         address tokenIn,
         address tokenOut,
         address mid,
@@ -292,12 +302,14 @@ contract ZHubComparator {
         if (cb.length == 0) return (0, "");
 
         // Leg 1 usually delivers more than the floor. That surplus is left in the
-        // router, where the public sweep makes it anyone's, so hand it to the
-        // recipient explicitly. It arrives as the intermediate token.
+        // router, where the public sweep makes it anyone's, so hand it over
+        // explicitly. Note this moves the router's WHOLE balance of the
+        // intermediate, not just our surplus, and it arrives as the intermediate
+        // token rather than tokenOut — which is why it goes to refundTo.
         bytes[] memory calls = new bytes[](3);
         calls[0] = ca;
         calls[1] = cb;
-        calls[2] = abi.encodeWithSelector(IZRouter.sweep.selector, mid, uint256(0), uint256(0), to);
+        calls[2] = abi.encodeWithSelector(IZRouter.sweep.selector, mid, uint256(0), uint256(0), refundTo);
         return (qb.amountOut, abi.encodeWithSelector(IZRouter.multicall.selector, calls));
     }
 

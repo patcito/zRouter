@@ -29,6 +29,7 @@ contract ZHubComparatorTest is Test {
     address internal constant FTUSD = 0xF7D85EC4E7710f71992752eac2111312e73E9C9C;
 
     address internal recipient = address(0xBEEF);
+    address internal refundSink = address(0xFEED);
 
     function setUp() public {
         comparator = new ZHubComparator();
@@ -45,7 +46,7 @@ contract ZHubComparatorTest is Test {
         uint256 amountIn = 1e18;
 
         (uint256 out, bytes memory cd, bool viaHub, address hub) =
-            comparator.bestExactIn(recipient, MKR, USDC, amountIn, 50, _deadline());
+            comparator.bestExactIn(recipient, refundSink, MKR, USDC, amountIn, 50, _deadline());
 
         (IZQuoter.Quote memory direct,,,) =
             QUOTER.buildBestSwap(recipient, false, MKR, USDC, amountIn, 50, _deadline());
@@ -64,7 +65,7 @@ contract ZHubComparatorTest is Test {
     function test_HubCalldataExecutes() public {
         uint256 amountIn = 1e18;
         (uint256 quoted, bytes memory cd, bool viaHub,) =
-            comparator.bestExactIn(recipient, MKR, USDC, amountIn, 100, _deadline());
+            comparator.bestExactIn(recipient, refundSink, MKR, USDC, amountIn, 100, _deadline());
         assertTrue(viaHub, "expected a hub route");
 
         deal(MKR, address(this), amountIn);
@@ -91,7 +92,7 @@ contract ZHubComparatorTest is Test {
         uint256[3] memory amts = [uint256(1_000_000e6), 1_000e6, 10e18];
 
         for (uint256 i; i < ins.length; ++i) {
-            (uint256 out,,,) = comparator.bestExactIn(recipient, ins[i], outs[i], amts[i], 50, _deadline());
+            (uint256 out,,,) = comparator.bestExactIn(recipient, refundSink, ins[i], outs[i], amts[i], 50, _deadline());
 
             uint256 directOut;
             try QUOTER.buildBestSwap(recipient, false, ins[i], outs[i], amts[i], 50, _deadline()) returns (
@@ -111,7 +112,7 @@ contract ZHubComparatorTest is Test {
     function test_DirectCalldataExecutes() public {
         uint256 amountIn = 10_000e6;
         (uint256 quoted, bytes memory cd,,) =
-            comparator.bestExactIn(recipient, USDC, WETH, amountIn, 100, _deadline());
+            comparator.bestExactIn(recipient, refundSink, USDC, WETH, amountIn, 100, _deadline());
 
         deal(USDC, address(this), amountIn);
         IERC20(USDC).approve(ZROUTER, amountIn);
@@ -127,13 +128,13 @@ contract ZHubComparatorTest is Test {
 
     function test_RejectsNativeAndDegenerateInputs() public {
         vm.expectRevert(bytes("native ETH unsupported"));
-        comparator.bestExactIn(recipient, address(0), USDC, 1e18, 50, _deadline());
+        comparator.bestExactIn(recipient, refundSink, address(0), USDC, 1e18, 50, _deadline());
 
         vm.expectRevert(bytes("identical tokens"));
-        comparator.bestExactIn(recipient, USDC, USDC, 1e18, 50, _deadline());
+        comparator.bestExactIn(recipient, refundSink, USDC, USDC, 1e18, 50, _deadline());
 
         vm.expectRevert(bytes("zero amount"));
-        comparator.bestExactIn(recipient, MKR, USDC, 0, 50, _deadline());
+        comparator.bestExactIn(recipient, refundSink, MKR, USDC, 0, 50, _deadline());
     }
 
     /// type(uint256).max is zRouter's SushiSwap sentinel in swapV2, not "no
@@ -142,7 +143,7 @@ contract ZHubComparatorTest is Test {
         uint256 amountIn = 10_000e6;
 
         (uint256 quoted, bytes memory cd,,) =
-            comparator.bestExactIn(recipient, USDC, WETH, amountIn, 100, type(uint256).max);
+            comparator.bestExactIn(recipient, refundSink, USDC, WETH, amountIn, 100, type(uint256).max);
         assertGt(cd.length, 0, "expected calldata");
 
         // The clamp must not break execution, and the fill must still match the
@@ -165,7 +166,7 @@ contract ZHubComparatorTest is Test {
     function test_HubRouteSurvivesDustDonation() public {
         uint256 amountIn = 1e18;
         (uint256 quoted, bytes memory cd, bool viaHub, address hub) =
-            comparator.bestExactIn(recipient, MKR, USDC, amountIn, 100, _deadline());
+            comparator.bestExactIn(recipient, refundSink, MKR, USDC, amountIn, 100, _deadline());
         assertTrue(viaHub, "expected a hub route");
 
         // A griefer donates dust of the intermediate to the router.
@@ -188,7 +189,7 @@ contract ZHubComparatorTest is Test {
     function test_SurplusIsSweptToRecipient() public {
         uint256 amountIn = 1e18;
         (, bytes memory cd, bool viaHub, address hub) =
-            comparator.bestExactIn(recipient, MKR, USDC, amountIn, 100, _deadline());
+            comparator.bestExactIn(recipient, refundSink, MKR, USDC, amountIn, 100, _deadline());
         assertTrue(viaHub, "expected a hub route");
 
         uint256 routerBefore = IERC20(hub).balanceOf(ZROUTER);
@@ -200,6 +201,9 @@ contract ZHubComparatorTest is Test {
         assertLe(
             IERC20(hub).balanceOf(ZROUTER), routerBefore, "intermediate surplus was left stranded in the router"
         );
+        // And it must land on refundTo, never on the output recipient, which
+        // accounts only for tokenOut.
+        assertEq(IERC20(hub).balanceOf(recipient), 0, "intermediate leaked to the output recipient");
     }
 
     /// The deployed quoter misprices Curve underlying (meta) pools: 1,000 USDC to
@@ -210,7 +214,7 @@ contract ZHubComparatorTest is Test {
         uint256 amountIn = 1_000e6;
 
         (uint256 out, bytes memory cd,,) =
-            comparator.bestExactIn(recipient, USDC, USDT, amountIn, 100, _deadline());
+            comparator.bestExactIn(recipient, refundSink, USDC, USDT, amountIn, 100, _deadline());
 
         // Whatever survives must be sane for a stablecoin pair: never a multiple
         // of the input. The mispriced quote would show ~2.19e9 for a 1e9 input.

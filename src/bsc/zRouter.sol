@@ -4,8 +4,10 @@ pragma solidity ^0.8.33;
 /// @dev pancakeV2 / sushi / pancakeV3 / uniV3 / uniV4 / curve / zaps
 ///      multi-amm multi-call router (BNB Smart Chain)
 ///      optimized with simple abi.
-///      `deadline == type(uint256).max` selects SushiSwap (swapV2)
-///      or Uniswap V3 (swapV3) instead of PancakeSwap.
+///      Venue selection: bit 255 of `deadline` (ALT_VENUE) selects SushiSwap (swapV2)
+///      or Uniswap V3 (swapV3) instead of PancakeSwap; the lower 255 bits remain a
+///      real, enforced deadline. Legacy `type(uint256).max` still works (alt venue,
+///      effectively no expiry).
 contract zRouter {
     error BadSwap();
     error Expired();
@@ -47,10 +49,13 @@ contract zRouter {
 
         bool sushiSwap;
         unchecked {
-            if (deadline == type(uint256).max) {
-                (sushiSwap, deadline) = (true, block.timestamp + 30 minutes);
+            if (deadline >= ALT_VENUE) {
+                // bit-255 venue flag: alternate venue, lower 255 bits are the
+                // real deadline (`type(uint256).max` remains valid legacy input):
+                (sushiSwap, deadline) = (true, deadline - ALT_VENUE);
             }
         }
+        require(block.timestamp <= deadline, Expired());
         // PancakeSwap V2 charges 0.25% (9975/10000); SushiSwap charges 0.3% (997/1000):
         (uint256 feeNum, uint256 feeDen) = sushiSwap ? (uint256(997), 1000) : (uint256(9975), 10000);
 
@@ -68,7 +73,7 @@ contract zRouter {
                 require(amountLimit == 0 || amountIn <= amountLimit, Slippage());
             } else {
                 if (swapAmount == 0) {
-                    amountIn = ethIn ? msg.value : balanceOf(tokenIn);
+                    amountIn = ethIn ? msg.value : _creditOrBalance(tokenIn);
                     if (amountIn == 0) revert BadSwap();
                 } else {
                     amountIn = swapAmount;
@@ -86,6 +91,10 @@ contract zRouter {
                             _safeTransferETH(msg.sender, msg.value - amountIn);
                         }
                     }
+                } else if (swapAmount == 0) {
+                    // auto-consume sized from the router's own balance — never charge
+                    // the caller for it:
+                    safeTransfer(tokenIn, pool, amountIn);
                 } else {
                     safeTransferFrom(tokenIn, msg.sender, pool, amountIn);
                 }
@@ -124,24 +133,30 @@ contract zRouter {
 
         bool uniV3;
         unchecked {
-            if (deadline == type(uint256).max) {
-                (uniV3, deadline) = (true, block.timestamp + 30 minutes);
+            if (deadline >= ALT_VENUE) {
+                // bit-255 venue flag: Uniswap V3, lower 255 bits are the real deadline:
+                (uniV3, deadline) = (true, deadline - ALT_VENUE);
             }
         }
+        require(block.timestamp <= deadline, Expired());
 
         (address pool, bool zeroForOne) = _v3PoolFor(tokenIn, tokenOut, swapFee, uniV3);
         uint160 sqrtPriceLimitX96 = zeroForOne ? MIN_SQRT_RATIO_PLUS_ONE : MAX_SQRT_RATIO_MINUS_ONE;
 
         unchecked {
+            bool autoConsume;
             if (!exactOut && swapAmount == 0) {
-                swapAmount = ethIn ? msg.value : balanceOf(tokenIn);
+                autoConsume = !ethIn;
+                swapAmount = ethIn ? msg.value : _creditOrBalance(tokenIn);
                 if (swapAmount == 0) revert BadSwap();
             }
             // Bind the callback to this in-flight swap (pool + payer) so a directly-
-            // called pool cannot trick the router into spending a third party's allowance:
+            // called pool cannot trick the router into spending a third party's allowance.
+            // Slot 0x03 marks auto-consume: fund from the router's own balance.
             assembly ("memory-safe") {
                 tstore(0x01, pool)
                 tstore(0x02, caller())
+                tstore(0x03, autoConsume)
             }
             (int256 a0, int256 a1) = IV3Pool(pool)
                 .swap(
@@ -154,6 +169,7 @@ contract zRouter {
             assembly ("memory-safe") {
                 tstore(0x01, 0)
                 tstore(0x02, 0)
+                tstore(0x03, 0)
             }
 
             if (amountLimit != 0) {
@@ -227,7 +243,16 @@ contract zRouter {
             } else if (ethIn) {
                 wrapETH(pool, amountRequired);
             } else {
-                safeTransferFrom(tokenIn, payer, pool, amountRequired);
+                bool autoConsume;
+                assembly ("memory-safe") {
+                    autoConsume := tload(0x03)
+                }
+                if (autoConsume) {
+                    // sized from the router's own balance — never charge the payer:
+                    safeTransfer(tokenIn, pool, amountRequired);
+                } else {
+                    safeTransferFrom(tokenIn, payer, pool, amountRequired);
+                }
             }
             if (ethOut) {
                 uint256 amountOut = uint256(-(zeroForOne ? amount1Delta : amount0Delta));
@@ -325,7 +350,7 @@ contract zRouter {
         } else {
             // exact-in flow:
             if (swapAmount == 0) {
-                amountIn = ethIn ? msg.value : balanceOf(inputToken);
+                amountIn = ethIn ? msg.value : _creditOrBalance(inputToken);
                 if (amountIn == 0) revert BadSwap();
             } else {
                 amountIn = swapAmount;
@@ -342,7 +367,9 @@ contract zRouter {
                 if (ethIn) {
                     if (msg.value < need) revert InvalidMsgVal();
                     wrap(need); // wrap exactly what we need as WBNB
-                } else {
+                } else if (swapAmount != 0) {
+                    // auto-consume (swapAmount == 0) sized from the router's own
+                    // balance — already held, nothing to pull:
                     safeTransferFrom(firstToken, msg.sender, address(this), need);
                 }
             }
@@ -509,9 +536,17 @@ contract zRouter {
         uint256 amountLimit,
         uint256 deadline
     ) public payable checkDeadline(deadline) returns (uint256 amountIn, uint256 amountOut) {
+        bool autoConsume;
         if (!exactOut && swapAmount == 0) {
-            swapAmount = tokenIn == address(0) ? msg.value : balanceOf(tokenIn);
+            autoConsume = tokenIn != address(0);
+            swapAmount = tokenIn == address(0) ? msg.value : _creditOrBalance(tokenIn);
             if (swapAmount == 0) revert BadSwap();
+        }
+        if (autoConsume) {
+            // mark for unlockCallback: fund from the router's own balance, never the payer
+            assembly ("memory-safe") {
+                tstore(0x03, 1)
+            }
         }
         (amountIn, amountOut) = abi.decode(
             IV4PoolManager(V4_POOL_MANAGER)
@@ -530,6 +565,11 @@ contract zRouter {
                 ),
             (uint256, uint256)
         );
+        if (autoConsume) {
+            assembly ("memory-safe") {
+                tstore(0x03, 0)
+            }
+        }
         depositFor(tokenOut, 0, amountOut, to); // marks output target
     }
 
@@ -593,12 +633,25 @@ contract zRouter {
                     );
                 }
             } else if (!ethIn) {
-                safeTransferFrom(
-                    tokenIn,
-                    payer,
-                    msg.sender, // V4_POOL_MANAGER
-                    amountIn
-                );
+                bool autoConsume;
+                assembly ("memory-safe") {
+                    autoConsume := tload(0x03)
+                }
+                if (autoConsume) {
+                    // sized from the router's own balance — never charge the payer:
+                    safeTransfer(
+                        tokenIn,
+                        msg.sender, // V4_POOL_MANAGER
+                        amountIn
+                    );
+                } else {
+                    safeTransferFrom(
+                        tokenIn,
+                        payer,
+                        msg.sender, // V4_POOL_MANAGER
+                        amountIn
+                    );
+                }
             }
 
             uint256 amountOut = !exactOut ? takeAmount : swapAmount;
@@ -1066,12 +1119,16 @@ interface ITriCryptoNgPool {
 
 // Uniswap helpers:
 
+/// @dev Bit 255 of the `deadline` argument flags the alternate venue (SushiSwap in
+///      swapV2, Uniswap V3 in swapV3); the remaining 255 bits are the deadline.
+uint256 constant ALT_VENUE = 1 << 255;
+
 // PancakeSwap V2 (0.25% fee):
 address constant V2_FACTORY = 0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73;
 bytes32 constant V2_POOL_INIT_CODE_HASH =
     0x00fb7f630766e6a796048ea87d01acd3068e8ff67d078148a3fa3f4a84f69bd5;
 
-// SushiSwap on BSC (0.3% fee) — selected via `deadline == type(uint256).max`:
+// SushiSwap on BSC (0.3% fee) — selected via the ALT_VENUE deadline bit:
 address constant SUSHI_FACTORY = 0xc35DADB65012eC5796536bD9864eD8773aBc74C4;
 bytes32 constant SUSHI_POOL_INIT_CODE_HASH =
     0xe18a34eb0e04b04f7a0ac29a6e80748dca96319b42c54d679cb821dca90c6303;
@@ -1087,7 +1144,7 @@ address constant V3_POOL_DEPLOYER = 0x41ff9AA7e16B8B1a8a8dc4f0eFacd93D02d071c9;
 bytes32 constant V3_POOL_INIT_CODE_HASH =
     0x6ce8eb472fa82df5469c6ab6d485f17c3ad13c8cd7af59b3d4a8026c5ce0f7e2;
 
-// Uniswap V3 on BSC — selected via `deadline == type(uint256).max`:
+// Uniswap V3 on BSC — selected via the ALT_VENUE deadline bit:
 address constant UNI_V3_FACTORY = 0xdB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7;
 bytes32 constant UNI_V3_POOL_INIT_CODE_HASH =
     0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54;
@@ -1273,6 +1330,31 @@ function depositFor(address token, uint256 id, uint256 amount, address _for) {
         tstore(slot, add(tload(slot), amount))
         mstore(0x40, m)
     }
+}
+
+/// @dev Auto-consume sizing for `swapAmount == 0`: prefer the router's transient
+///      credit (chained leg output) over its raw physical balance. Without this, a
+///      stray/donated intermediate-token balance would make a chained leg pull the
+///      whole inflated amount from the caller (credit is all-or-nothing).
+///      Caveats of credit-first sizing (accepted trade-offs — summing would reopen
+///      the donation vector):
+///      - fee-on-transfer/rebasing tokens credit the computed output, which can
+///        exceed the physical receipt; auto-consume then reverts on transfer
+///        (liveness only — such tokens are already mispriced by the AMM math).
+///      - partial sweep()/unwrap() reduces physical balance without reducing
+///        credit; a later auto-consume sizes to the stale credit and reverts.
+///      - when a credit and an intentional uncredited balance coexist, only the
+///        credit is consumed; the residue stays in the router (sweep()-able).
+function _creditOrBalance(address token) view returns (uint256 amount) {
+    assembly ("memory-safe") {
+        let m := mload(0x40)
+        mstore(0x00, address())
+        mstore(0x20, token)
+        mstore(0x40, 0x00)
+        amount := tload(keccak256(0x00, 0x60))
+        mstore(0x40, m)
+    }
+    if (amount == 0) amount = balanceOf(token);
 }
 
 // ** PERMIT HELPERS
