@@ -19,17 +19,32 @@ pragma solidity ^0.8.30;
 /// comparison, and the multicall assembly.
 ///
 /// SAFETY. There is no state, no owner, no constructor arguments and no token
-/// custody: it cannot hold, move or approve funds. Its only output is a quote and
-/// a calldata blob for the caller to execute against zRouter, where the caller's
-/// own min-out still binds. A wrong answer here can cost execution quality, never
-/// principal.
+/// custody: this contract cannot hold, move or approve funds, and its only output
+/// is a quote plus a calldata blob for the caller to execute against zRouter,
+/// where the caller's own min-out still binds. Note that the calldata it emits is
+/// executed by the caller with the caller's allowances, so route construction
+/// still has to be defensive — see LEG-2 SIZING.
 ///
-/// LEG-2 SIZING. The second leg is built with `swapAmount = 0`, zRouter's
-/// auto-consume convention: the router swaps its entire intermediate balance
-/// rather than a number fixed at quote time. That is what makes a two-leg route
-/// safe to assemble off-chain, since leg two cannot ask for more than leg one
-/// actually delivered, and no dust is stranded. It mirrors what the newer zQuoter
-/// source does for its own exact-in hub plans.
+/// LEG-2 SIZING. The second leg is sized to leg one's ENFORCED FLOOR —
+/// `amountOut * (1 - slippageBps)`, the minimum leg one's own min-out
+/// guarantees — and any surplus is swept to the recipient by a trailing call.
+///
+/// It deliberately does NOT use zRouter's `swapAmount = 0` auto-consume, despite
+/// that being what the upstream builder does for its own hub plans. Auto-consume
+/// resolves to the router's ENTIRE balance of the intermediate token, not to what
+/// leg one delivered, while the transient credit covers only the delivery. Anyone
+/// can transfer 1 wei of a hub token to the router, and the balance then exceeds
+/// the credit, so the all-or-nothing credit check fails and the router falls back
+/// to `safeTransferFrom(tokenIn, msg.sender, ...)`. For a caller with no
+/// allowance that bricks every hub route through that token for the price of
+/// dust; for a caller who does have one — and the hubs here are exactly the
+/// most-commonly-approved tokens — the swap is funded from the caller's own
+/// wallet while leg one's proceeds sit uncredited in the router, where the public
+/// `sweep` lets anyone take them.
+///
+/// Sizing to the floor makes the credit always sufficient, so that fallback is
+/// unreachable. The cost is that up to `slippageBps` of the intermediate may go
+/// unswapped; it is swept to the recipient rather than stranded.
 ///
 /// Derived from zRouter (https://github.com/z-fi/zRouter), MIT, (c) 2025 z0r0z:
 /// the leg encoders and the tick-spacing map below are ports of its internal
@@ -137,6 +152,8 @@ interface IZRouter {
         uint256 deadline
     ) external payable returns (uint256, uint256);
 
+    function sweep(address token, uint256 id, uint256 amount, address to) external payable;
+
     function multicall(bytes[] calldata data) external payable returns (bytes[] memory);
 }
 
@@ -200,7 +217,10 @@ contract ZHubComparator {
             if (mid == tokenIn || mid == tokenOut) continue;
 
             (uint256 out, bytes memory cd) = _hubRoute(to, tokenIn, tokenOut, mid, amountIn, slippageBps, deadline);
-            if (out > amountOut) {
+            // Upstream's margin: a hub route must beat the incumbent by >~2%, not
+            // by a wei. A two-leg route carries more revert risk than a direct
+            // one, so a marginal gain is not worth switching for.
+            if (out != 0 && (amountOut == 0 || out * 49 > amountOut * 50)) {
                 amountOut = out;
                 callData = cd;
                 viaHub = true;
@@ -238,11 +258,16 @@ contract ZHubComparator {
         // A wrap is not a swap: it would make "hub" a relabelled direct route.
         if (qa.source == IZQuoter.AMM.WETH_WRAP || qa.source == IZQuoter.AMM.LIDO) return (0, "");
 
-        // Leg 2 is quoted at leg 1's expected output to choose the venue and
-        // price it. Only the QUOTE is kept: the returned calldata embeds a fixed
-        // input amount, which would revert if leg 1 delivered a hair less.
+        // Leg 2 is both PRICED and SIZED at leg 1's enforced floor, the least it
+        // can deliver. Quoting at its expected output instead would report an
+        // optimistic number, bias the hub-vs-direct comparison, and leave leg 2's
+        // min-out with no headroom if leg 1 filled at its floor. This matches what
+        // the upstream builder does for its own hub legs.
+        uint256 midFloor = _limit(qa.amountOut, slippageBps);
+        if (midFloor == 0) return (0, "");
+
         IZQuoter.Quote memory qb;
-        try QUOTER.buildBestSwap(to, false, mid, tokenOut, qa.amountOut, slippageBps, deadline) returns (
+        try QUOTER.buildBestSwap(to, false, mid, tokenOut, midFloor, slippageBps, deadline) returns (
             IZQuoter.Quote memory q, bytes memory, uint256, uint256
         ) {
             qb = q;
@@ -252,33 +277,40 @@ contract ZHubComparator {
         if (qb.amountOut == 0) return (0, "");
         if (qb.source == IZQuoter.AMM.WETH_WRAP || qb.source == IZQuoter.AMM.LIDO) return (0, "");
 
-        // Rebuild leg 2 to auto-consume whatever leg 1 actually delivered.
-        bytes memory cb = _buildAutoConsumeLeg(to, mid, tokenOut, qa.amountOut, _limit(qb.amountOut, slippageBps), deadline, qb);
+        // A zero min-out is zRouter's "skip the slippage check" sentinel, so a
+        // dust-priced leg would execute unprotected. Skip the hub instead.
+        uint256 legTwoLimit = _limit(qb.amountOut, slippageBps);
+        if (legTwoLimit == 0) return (0, "");
+
+        bytes memory cb = _buildLeg(to, mid, tokenOut, midFloor, legTwoLimit, deadline, qb);
         if (cb.length == 0) return (0, "");
 
-        bytes[] memory calls = new bytes[](2);
+        // Leg 1 usually delivers more than the floor. That surplus is left in the
+        // router, where the public sweep makes it anyone's, so hand it to the
+        // recipient explicitly. It arrives as the intermediate token.
+        bytes[] memory calls = new bytes[](3);
         calls[0] = ca;
         calls[1] = cb;
+        calls[2] = abi.encodeWithSelector(IZRouter.sweep.selector, mid, uint256(0), uint256(0), to);
         return (qb.amountOut, abi.encodeWithSelector(IZRouter.multicall.selector, calls));
     }
 
-    /// @dev Encode one leg with swapAmount = 0 so zRouter consumes its whole
-    ///      balance of `tokenIn`. `quotedIn` is only used to re-derive Curve pool
-    ///      parameters. Returns "" for a venue we cannot encode.
-    function _buildAutoConsumeLeg(
+    /// @dev Encode one leg for an explicit `swapAmount`. Returns "" for a venue
+    ///      we cannot encode.
+    function _buildLeg(
         address to,
         address tokenIn,
         address tokenOut,
-        uint256 quotedIn,
+        uint256 swapAmount,
         uint256 amountLimit,
         uint256 deadline,
         IZQuoter.Quote memory q
     ) internal view returns (bytes memory) {
         if (q.source == IZQuoter.AMM.CURVE) {
             (,, address pool, bool useUnd, bool isStab, uint8 ci, uint8 cj) =
-                QUOTER.quoteCurve(false, tokenIn, tokenOut, quotedIn, 8);
+                QUOTER.quoteCurve(false, tokenIn, tokenOut, swapAmount, 8);
             if (pool == address(0)) return "";
-            return _buildCurveLeg(to, tokenIn, tokenOut, amountLimit, deadline, pool, useUnd, isStab, ci, cj);
+            return _buildCurveLeg(to, tokenIn, tokenOut, swapAmount, amountLimit, deadline, pool, useUnd, isStab, ci, cj);
         }
         if (q.source == IZQuoter.AMM.UNI_V2 || q.source == IZQuoter.AMM.SUSHI) {
             return abi.encodeWithSelector(
@@ -287,7 +319,7 @@ contract ZHubComparator {
                 false,
                 tokenIn,
                 tokenOut,
-                uint256(0),
+                swapAmount,
                 amountLimit,
                 q.source == IZQuoter.AMM.SUSHI ? type(uint256).max : deadline
             );
@@ -302,7 +334,7 @@ contract ZHubComparator {
                 tokenOut,
                 uint256(0),
                 uint256(0),
-                uint256(0),
+                swapAmount,
                 amountLimit,
                 deadline
             );
@@ -315,7 +347,7 @@ contract ZHubComparator {
                 uint24(q.feeBps * 100),
                 tokenIn,
                 tokenOut,
-                uint256(0),
+                swapAmount,
                 amountLimit,
                 deadline
             );
@@ -329,7 +361,7 @@ contract ZHubComparator {
                 _spacingFromBps(uint16(q.feeBps)),
                 tokenIn,
                 tokenOut,
-                uint256(0),
+                swapAmount,
                 amountLimit,
                 deadline
             );
@@ -337,13 +369,14 @@ contract ZHubComparator {
         return ""; // V4_HOOKED and anything new: not encodable here.
     }
 
-    /// @dev Single-pool Curve leg with swapAmount = 0. Mirrors zQuoter's own
+    /// @dev Single-pool Curve leg. Mirrors zQuoter's own
     ///      encoder: route is [tokenIn, pool, tokenOut, 0…], swapParams[0] is
     ///      [i, j, swapType, poolType].
     function _buildCurveLeg(
         address to,
         address tokenIn,
         address tokenOut,
+        uint256 swapAmount,
         uint256 amountLimit,
         uint256 deadline,
         address pool,
@@ -366,7 +399,7 @@ contract ZHubComparator {
         address[5] memory basePools;
 
         return abi.encodeWithSelector(
-            IZRouter.swapCurve.selector, to, false, route, swapParams, basePools, uint256(0), amountLimit, deadline
+            IZRouter.swapCurve.selector, to, false, route, swapParams, basePools, swapAmount, amountLimit, deadline
         );
     }
 

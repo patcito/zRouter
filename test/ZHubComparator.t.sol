@@ -6,6 +6,7 @@ import {ZHubComparator, IZQuoter, IZRouter} from "../src/ZHubComparator.sol";
 
 interface IERC20 {
     function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
     function balanceOf(address account) external view returns (uint256);
 }
 
@@ -154,4 +155,51 @@ contract ZHubComparatorTest is Test {
         uint256 received = IERC20(WETH).balanceOf(recipient) - before;
         assertGe(received, quoted * 99 / 100, "max-deadline route did not match its quote");
     }
+
+    /// The attack that decided leg-2 sizing: anyone can transfer dust of the hub
+    /// token to zRouter. With auto-consume (swapAmount = 0) the router would try
+    /// to spend delivery + dust while only delivery is credited, fall through to
+    /// safeTransferFrom against the CALLER, and either revert or fund the swap
+    /// from the caller's wallet while leg 1's proceeds sat sweepable by anyone.
+    /// Sizing leg 2 to leg 1's enforced floor makes the credit always sufficient.
+    function test_HubRouteSurvivesDustDonation() public {
+        uint256 amountIn = 1e18;
+        (uint256 quoted, bytes memory cd, bool viaHub, address hub) =
+            comparator.bestExactIn(recipient, MKR, USDC, amountIn, 100, _deadline());
+        assertTrue(viaHub, "expected a hub route");
+
+        // A griefer donates dust of the intermediate to the router.
+        deal(hub, address(this), 1);
+        IERC20(hub).transfer(ZROUTER, 1);
+
+        deal(MKR, address(this), amountIn);
+        IERC20(MKR).approve(ZROUTER, amountIn);
+        // Deliberately grant NO allowance for the hub token: if the route ever
+        // falls back to pulling the intermediate from us, this reverts.
+        uint256 before = IERC20(USDC).balanceOf(recipient);
+        (bool ok,) = ZROUTER.call(cd);
+        assertTrue(ok, "dust donation bricked the hub route");
+        uint256 received = IERC20(USDC).balanceOf(recipient) - before;
+        assertGe(received, quoted * 95 / 100, "dust donation degraded the fill");
+    }
+
+    /// Leg 1's surplus over its floor must reach the recipient rather than
+    /// stranding in the router, where the public sweep makes it anyone's.
+    function test_SurplusIsSweptToRecipient() public {
+        uint256 amountIn = 1e18;
+        (, bytes memory cd, bool viaHub, address hub) =
+            comparator.bestExactIn(recipient, MKR, USDC, amountIn, 100, _deadline());
+        assertTrue(viaHub, "expected a hub route");
+
+        uint256 routerBefore = IERC20(hub).balanceOf(ZROUTER);
+        deal(MKR, address(this), amountIn);
+        IERC20(MKR).approve(ZROUTER, amountIn);
+        (bool ok,) = ZROUTER.call(cd);
+        assertTrue(ok, "execution reverted");
+
+        assertLe(
+            IERC20(hub).balanceOf(ZROUTER), routerBefore, "intermediate surplus was left stranded in the router"
+        );
+    }
+
 }
