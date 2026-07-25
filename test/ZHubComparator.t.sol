@@ -134,7 +134,6 @@ contract ZHubComparatorTest is Test {
         vm.expectRevert(bytes("zero amount"));
         comparator.bestExactIn(recipient, MKR, USDC, 0, 50, _deadline());
     }
-}
 
     /// type(uint256).max is zRouter's SushiSwap sentinel in swapV2, not "no
     /// expiry". Passing it through would execute a Uniswap V2 route on Sushi.
@@ -155,3 +154,4 @@ contract ZHubComparatorTest is Test {
         uint256 received = IERC20(WETH).balanceOf(recipient) - before;
         assertGe(received, quoted * 99 / 100, "max-deadline route did not match its quote");
     }
+}
