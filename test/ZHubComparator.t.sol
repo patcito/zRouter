@@ -135,3 +135,23 @@ contract ZHubComparatorTest is Test {
         comparator.bestExactIn(recipient, MKR, USDC, 0, 50, _deadline());
     }
 }
+
+    /// type(uint256).max is zRouter's SushiSwap sentinel in swapV2, not "no
+    /// expiry". Passing it through would execute a Uniswap V2 route on Sushi.
+    function test_MaxDeadlineDoesNotRerouteToSushi() public {
+        uint256 amountIn = 10_000e6;
+
+        (uint256 quoted, bytes memory cd,,) =
+            comparator.bestExactIn(recipient, USDC, WETH, amountIn, 100, type(uint256).max);
+        assertGt(cd.length, 0, "expected calldata");
+
+        // The clamp must not break execution, and the fill must still match the
+        // quote — i.e. we ran on the venue we priced.
+        deal(USDC, address(this), amountIn);
+        IERC20(USDC).approve(ZROUTER, amountIn);
+        uint256 before = IERC20(WETH).balanceOf(recipient);
+        (bool ok,) = ZROUTER.call(cd);
+        assertTrue(ok, "execution reverted with a max deadline");
+        uint256 received = IERC20(WETH).balanceOf(recipient) - before;
+        assertGe(received, quoted * 99 / 100, "max-deadline route did not match its quote");
+    }

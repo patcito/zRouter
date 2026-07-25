@@ -177,6 +177,14 @@ contract ZHubComparator {
         require(tokenIn != tokenOut, "identical tokens");
         require(amountIn != 0, "zero amount");
 
+        // deadline == type(uint256).max is zRouter's SushiSwap sentinel in swapV2,
+        // not "no expiry": passing it through would silently execute a route we
+        // priced on Uniswap V2 against SushiSwap instead. Clamp to the same
+        // 30-minute default the router itself substitutes, which preserves the
+        // caller's intent without moving the venue. A Sushi winner still gets the
+        // sentinel explicitly from the leg encoder below.
+        if (deadline == type(uint256).max) deadline = block.timestamp + 30 minutes;
+
         // Direct route, straight from the deployed quoter. It may revert NoRoute,
         // which is not fatal: a hub route can still serve the pair.
         try QUOTER.buildBestSwap(to, false, tokenIn, tokenOut, amountIn, slippageBps, deadline) returns (
