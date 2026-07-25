@@ -298,18 +298,31 @@ contract ZHubComparator {
         uint256 legTwoLimit = _limit(qb.amountOut, slippageBps);
         if (legTwoLimit == 0) return (0, "");
 
-        bytes memory cb = _buildLeg(to, mid, tokenOut, midFloor, legTwoLimit, deadline, qb);
+        // Leg 2 is encoded to auto-consume (swapAmount = 0), which spends the
+        // router's whole balance of the intermediate. That is only safe because
+        // of the leading sweep below: it clears any balance the router already
+        // held, so once leg 1 runs the balance is exactly leg 1's delivery and
+        // the transient credit matches it. Without that clearing step a stray
+        // balance would exceed the credit, the all-or-nothing credit check would
+        // fail, and the router would fall back to pulling the difference from
+        // whoever sent the transaction.
+        //
+        // Sizing leg 2 this way also means the whole delivery is swapped, so no
+        // surplus is left behind and no value has to be handed back afterwards.
+        // Leg 2 is still PRICED at leg 1's floor, so the quote stays conservative:
+        // it executes on at least that much.
+        bytes memory cb = _buildLeg(to, mid, tokenOut, 0, legTwoLimit, deadline, qb);
         if (cb.length == 0) return (0, "");
 
-        // Leg 1 usually delivers more than the floor. That surplus is left in the
-        // router, where the public sweep makes it anyone's, so hand it over
-        // explicitly. Note this moves the router's WHOLE balance of the
-        // intermediate, not just our surplus, and it arrives as the intermediate
-        // token rather than tokenOut — which is why it goes to refundTo.
         bytes[] memory calls = new bytes[](3);
-        calls[0] = ca;
-        calls[1] = cb;
-        calls[2] = abi.encodeWithSelector(IZRouter.sweep.selector, mid, uint256(0), uint256(0), refundTo);
+        // Clearing step. In the normal case the router holds nothing and this
+        // moves nothing. It only carries value when the router already held some
+        // of the intermediate, which is not ours and is claimable by anyone
+        // through the public sweep regardless; it goes to refundTo rather than to
+        // the output recipient, which accounts strictly for tokenOut.
+        calls[0] = abi.encodeWithSelector(IZRouter.sweep.selector, mid, uint256(0), uint256(0), refundTo);
+        calls[1] = ca;
+        calls[2] = cb;
         return (qb.amountOut, abi.encodeWithSelector(IZRouter.multicall.selector, calls));
     }
 
@@ -346,9 +359,13 @@ contract ZHubComparator {
         uint256 deadline,
         IZQuoter.Quote memory q
     ) internal view returns (bytes memory) {
+        // Curve pool parameters must be re-derived from the amount the leg was
+        // PRICED at; swapAmount may be 0 (auto-consume), which would not resolve
+        // to a pool.
+        uint256 pricedAmount = swapAmount == 0 ? q.amountIn : swapAmount;
         if (q.source == IZQuoter.AMM.CURVE) {
             (,, address pool, bool useUnd, bool isStab, uint8 ci, uint8 cj) =
-                QUOTER.quoteCurve(false, tokenIn, tokenOut, swapAmount, 8);
+                QUOTER.quoteCurve(false, tokenIn, tokenOut, pricedAmount, 8);
             if (pool == address(0)) return "";
             // An underlying (meta-pool) Curve leg needs the basePools array this
             // encoder does not populate, and such quotes have been observed

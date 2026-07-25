@@ -184,9 +184,10 @@ contract ZHubComparatorTest is Test {
         assertGe(received, quoted * 95 / 100, "dust donation degraded the fill");
     }
 
-    /// Leg 1's surplus over its floor must reach the recipient rather than
-    /// stranding in the router, where the public sweep makes it anyone's.
-    function test_SurplusIsSweptToRecipient() public {
+    /// Leg 2 auto-consumes leg 1's whole delivery, so nothing of the
+    /// intermediate is left in the router afterwards and none of it leaks to the
+    /// output recipient, which accounts strictly for tokenOut.
+    function test_NoIntermediateLeftBehind() public {
         uint256 amountIn = 1e18;
         (, bytes memory cd, bool viaHub, address hub) =
             comparator.bestExactIn(recipient, refundSink, MKR, USDC, amountIn, 100, _deadline());
