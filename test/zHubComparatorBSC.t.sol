@@ -112,9 +112,9 @@ contract ZHubComparatorBSCTest is Test {
         // attacker griefs: 1 wei of the actual hub token lands in the router
         vm.prank(WHALE);
         IERC20(hub).transfer(address(router), 1);
-        // user even has a hub-token allowance (repeat zRouter user pattern):
+        // user even has hub-token balance + allowance (repeat zRouter user pattern):
         vm.prank(WHALE);
-        IERC20(hub).transfer(USER, 1_000 ether);
+        IERC20(hub).transfer(USER, 10 ether); // whale holds ~510 WBNB at pinned block
         vm.startPrank(USER);
         IERC20(CAKE).approve(address(router), 1000 ether);
         IERC20(hub).approve(address(router), type(uint256).max);
