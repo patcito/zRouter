@@ -202,4 +202,27 @@ contract ZHubComparatorTest is Test {
         );
     }
 
+    /// The deployed quoter misprices Curve underlying (meta) pools: 1,000 USDC to
+    /// USDT has been observed quoting ~2,196 USDT, a 2.2x return on a stablecoin
+    /// pair, whose calldata then reverts. Any route touching one must be
+    /// discarded rather than returned as a winner.
+    function test_RejectsMispricedUnderlyingCurveRoute() public {
+        uint256 amountIn = 1_000e6;
+
+        (uint256 out, bytes memory cd,,) =
+            comparator.bestExactIn(recipient, USDC, USDT, amountIn, 100, _deadline());
+
+        // Whatever survives must be sane for a stablecoin pair: never a multiple
+        // of the input. The mispriced quote would show ~2.19e9 for a 1e9 input.
+        emit log_named_uint("USDC->USDT out", out);
+        assertLt(out, amountIn * 12 / 10, "returned an implausible stablecoin quote");
+
+        // And it must actually execute.
+        deal(USDC, address(this), amountIn);
+        IERC20(USDC).approve(ZROUTER, amountIn);
+        uint256 before = IERC20(USDT).balanceOf(recipient);
+        (bool ok,) = ZROUTER.call(cd);
+        assertTrue(ok, "returned route reverted");
+        assertGt(IERC20(USDT).balanceOf(recipient) - before, 0, "recipient got nothing");
+    }
 }

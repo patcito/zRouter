@@ -207,8 +207,10 @@ contract ZHubComparator {
         try QUOTER.buildBestSwap(to, false, tokenIn, tokenOut, amountIn, slippageBps, deadline) returns (
             IZQuoter.Quote memory q, bytes memory cd, uint256, uint256
         ) {
-            amountOut = q.amountOut;
-            callData = cd;
+            if (!_isUnderlyingCurve(q, tokenIn, tokenOut, amountIn)) {
+                amountOut = q.amountOut;
+                callData = cd;
+            }
         } catch {}
 
         address[6] memory hubs = [WETH, USDC, USDT, DAI, WBTC, WSTETH];
@@ -257,6 +259,9 @@ contract ZHubComparator {
         if (qa.amountOut == 0 || ca.length == 0) return (0, "");
         // A wrap is not a swap: it would make "hub" a relabelled direct route.
         if (qa.source == IZQuoter.AMM.WETH_WRAP || qa.source == IZQuoter.AMM.LIDO) return (0, "");
+        // Leg 1 reuses the QUOTER's calldata, so an underlying-Curve misprice
+        // poisons both the route we would emit and the midFloor we size leg 2 by.
+        if (_isUnderlyingCurve(qa, tokenIn, mid, amountIn)) return (0, "");
 
         // Leg 2 is both PRICED and SIZED at leg 1's enforced floor, the least it
         // can deliver. Quoting at its expected output instead would report an
@@ -276,6 +281,7 @@ contract ZHubComparator {
         }
         if (qb.amountOut == 0) return (0, "");
         if (qb.source == IZQuoter.AMM.WETH_WRAP || qb.source == IZQuoter.AMM.LIDO) return (0, "");
+        if (_isUnderlyingCurve(qb, mid, tokenOut, midFloor)) return (0, "");
 
         // A zero min-out is zRouter's "skip the slippage check" sentinel, so a
         // dust-priced leg would execute unprotected. Skip the hub instead.
@@ -293,6 +299,28 @@ contract ZHubComparator {
         calls[1] = cb;
         calls[2] = abi.encodeWithSelector(IZRouter.sweep.selector, mid, uint256(0), uint256(0), to);
         return (qb.amountOut, abi.encodeWithSelector(IZRouter.multicall.selector, calls));
+    }
+
+
+    /// @dev True when a quote priced against a Curve UNDERLYING (meta) pool.
+    ///      The deployed quoter misprices these — 1,000 USDC to USDT has been
+    ///      observed quoting 2,196 USDT, a 2.2x return on a stablecoin pair — and
+    ///      the calldata built from them reverts. Neither the quoter's own
+    ///      calldata nor ours can be trusted for such a quote, so every route
+    ///      that touches one is discarded.
+    function _isUnderlyingCurve(IZQuoter.Quote memory q, address tokenIn, address tokenOut, uint256 amountIn)
+        internal
+        view
+        returns (bool)
+    {
+        if (q.source != IZQuoter.AMM.CURVE) return false;
+        try QUOTER.quoteCurve(false, tokenIn, tokenOut, amountIn, 8) returns (
+            uint256, uint256, address pool, bool usedUnderlying, bool, uint8, uint8
+        ) {
+            return pool == address(0) || usedUnderlying;
+        } catch {
+            return true; // cannot classify it, so do not use it
+        }
     }
 
     /// @dev Encode one leg for an explicit `swapAmount`. Returns "" for a venue
